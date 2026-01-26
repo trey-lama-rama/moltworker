@@ -194,7 +194,13 @@ async function proxyToClawdbot(
   request: Request,
   sandbox: Sandbox
 ): Promise<Response> {
-  // Use containerFetch which handles both HTTP and WebSocket
+  // Check if this is a WebSocket upgrade request
+  if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+    console.log('Proxying WebSocket connection to Clawdbot');
+    return sandbox.wsConnect(request, CLAWDBOT_PORT);
+  }
+  
+  // Regular HTTP request
   return sandbox.containerFetch(request, CLAWDBOT_PORT);
 }
 
