@@ -37,7 +37,7 @@
     
     @keyframes pulse {
       0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.8; transform: scale(0.98); }
+      50% { opacity: 0.95; transform: scale(0.98); }
     }
     
     h1 {
@@ -59,6 +59,10 @@
       justify-content: center;
       gap: 12px;
       margin-bottom: 20px;
+    }
+    
+    .spinner-container h1 {
+      margin: 0;
     }
     
     .spinner {
@@ -112,7 +116,7 @@
 </head>
 <body>
   <div class="container">
-    <img src="/_loading/logo.png" alt="Moltworker" class="logo">
+    <img src="/logo.png" alt="Moltworker" class="logo">
     
     <div class="spinner-container">
       <div class="spinner"></div>

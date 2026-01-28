@@ -7,6 +7,7 @@ declare module '*.html' {
 }
 
 declare module '*.png' {
-  const content: ArrayBuffer;
+  // Vite compiles PNG imports to URL paths (strings), not binary data
+  const content: string;
   export default content;
 }

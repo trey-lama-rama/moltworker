@@ -10,6 +10,14 @@
   padding: 1rem 2rem;
   border-bottom: 1px solid var(--border-color);
   box-shadow: var(--shadow);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.header-logo {
+  height: 36px;
+  width: auto;
 }
 
 .app-header h1 {

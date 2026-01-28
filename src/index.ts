@@ -29,9 +29,50 @@ import { createAccessMiddleware } from './auth';
 import { ensureClawdbotGateway, findExistingClawdbotProcess, syncToR2 } from './gateway';
 import { api, admin, debug, cdp } from './routes';
 import loadingPageHtml from './assets/loading.html';
-import logoImage from './assets/moltworker-logo-large.png';
+import configErrorHtml from './assets/config-error.html';
+
+/**
+ * Transform error messages from the gateway to be more user-friendly.
+ */
+function transformErrorMessage(message: string, host: string): string {
+  if (message.includes('gateway token missing')) {
+    return `Token missing. Visit https://${host}?token=CLAWDBOT_GATEWAY_TOKEN`;
+  }
+  
+  if (message.includes('pairing required')) {
+    return `Pairing required. Visit https://${host}/_admin/`;
+  }
+  
+  return message;
+}
 
 export { Sandbox };
+
+/**
+ * Validate required environment variables.
+ * Returns an array of missing variable descriptions, or empty array if all are set.
+ */
+function validateRequiredEnv(env: ClawdbotEnv): string[] {
+  const missing: string[] = [];
+
+  if (!env.CLAWDBOT_GATEWAY_TOKEN) {
+    missing.push('CLAWDBOT_GATEWAY_TOKEN');
+  }
+
+  if (!env.CF_ACCESS_TEAM_DOMAIN) {
+    missing.push('CF_ACCESS_TEAM_DOMAIN');
+  }
+
+  if (!env.CF_ACCESS_AUD) {
+    missing.push('CF_ACCESS_AUD');
+  }
+
+  if (!env.ANTHROPIC_API_KEY && !env.ANTHROPIC_BASE_URL) {
+    missing.push('ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL');
+  }
+
+  return missing;
+}
 
 /**
  * Build sandbox options based on environment configuration.
@@ -69,6 +110,48 @@ app.use('*', async (c, next) => {
   await next();
 });
 
+// Middleware: Validate required environment variables (skip in dev mode and for certain paths)
+app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  
+  // Skip validation for health check endpoint and static assets
+  if (url.pathname === '/sandbox-health' || url.pathname.endsWith('.png')) {
+    return next();
+  }
+  
+  // Skip validation for debug routes (they have their own enable check)
+  if (url.pathname.startsWith('/debug')) {
+    return next();
+  }
+  
+  // Skip validation in dev mode
+  if (c.env.DEV_MODE === 'true') {
+    return next();
+  }
+  
+  const missingVars = validateRequiredEnv(c.env);
+  if (missingVars.length > 0) {
+    console.error('[CONFIG] Missing required environment variables:', missingVars.join(', '));
+    
+    const acceptsHtml = c.req.header('Accept')?.includes('text/html');
+    if (acceptsHtml) {
+      // Return a user-friendly HTML error page
+      const html = configErrorHtml.replace('{{MISSING_VARS}}', missingVars.join(', '));
+      return c.html(html, 503);
+    }
+    
+    // Return JSON error for API requests
+    return c.json({
+      error: 'Configuration error',
+      message: 'Required environment variables are not configured',
+      missing: missingVars,
+      hint: 'Set these using: wrangler secret put <VARIABLE_NAME>',
+    }, 503);
+  }
+  
+  return next();
+});
+
 // Middleware: Initialize sandbox for all requests
 app.use('*', async (c, next) => {
   const options = buildSandboxOptions(c.env);
@@ -86,14 +169,13 @@ app.get('/sandbox-health', (c) => {
   });
 });
 
-// Loading page assets
-app.get('/_loading/logo.png', (c) => {
-  return new Response(logoImage, {
-    headers: {
-      'Content-Type': 'image/png',
-      'Cache-Control': 'public, max-age=86400',
-    },
-  });
+// Logos - serve from ASSETS binding (files are in public/ directory)
+app.get('/logo.png', (c) => {
+  return c.env.ASSETS.fetch(c.req.raw);
+});
+
+app.get('/logo-small.png', (c) => {
+  return c.env.ASSETS.fetch(c.req.raw);
 });
 
 // Mount API routes (protected by Cloudflare Access)
@@ -167,14 +249,107 @@ app.all('*', async (c) => {
     }, 503);
   }
 
-  // Proxy to Clawdbot
+  // Proxy to Clawdbot with WebSocket message interception
   if (isWebSocketRequest) {
     console.log('[WS] Proxying WebSocket connection to Clawdbot');
     console.log('[WS] URL:', request.url);
     console.log('[WS] Search params:', url.search);
-    const wsResponse = await sandbox.wsConnect(request, CLAWDBOT_PORT);
-    console.log('[WS] wsConnect response status:', wsResponse.status);
-    return wsResponse;
+    
+    // Get WebSocket connection to the container
+    const containerResponse = await sandbox.wsConnect(request, CLAWDBOT_PORT);
+    console.log('[WS] wsConnect response status:', containerResponse.status);
+    
+    // Get the container-side WebSocket
+    const containerWs = containerResponse.webSocket;
+    if (!containerWs) {
+      console.error('[WS] No WebSocket in container response - falling back to direct proxy');
+      return containerResponse;
+    }
+    
+    console.log('[WS] Got container WebSocket, setting up interception');
+    
+    // Create a WebSocket pair for the client
+    const [clientWs, serverWs] = Object.values(new WebSocketPair());
+    
+    // Accept both WebSockets
+    serverWs.accept();
+    containerWs.accept();
+    
+    console.log('[WS] Both WebSockets accepted');
+    console.log('[WS] containerWs.readyState:', containerWs.readyState);
+    console.log('[WS] serverWs.readyState:', serverWs.readyState);
+    
+    // Relay messages from client to container
+    serverWs.addEventListener('message', (event) => {
+      console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
+      if (containerWs.readyState === WebSocket.OPEN) {
+        containerWs.send(event.data);
+      } else {
+        console.log('[WS] Container not open, readyState:', containerWs.readyState);
+      }
+    });
+    
+    // Relay messages from container to client, with error transformation
+    containerWs.addEventListener('message', (event) => {
+      console.log('[WS] Container -> Client (raw):', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 500) : '(binary)');
+      let data = event.data;
+      
+      // Try to intercept and transform error messages
+      if (typeof data === 'string') {
+        try {
+          const parsed = JSON.parse(data);
+          console.log('[WS] Parsed JSON, has error.message:', !!parsed.error?.message);
+          if (parsed.error?.message) {
+            console.log('[WS] Original error.message:', parsed.error.message);
+            parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
+            console.log('[WS] Transformed error.message:', parsed.error.message);
+            data = JSON.stringify(parsed);
+          }
+        } catch (e) {
+          console.log('[WS] Not JSON or parse error:', e);
+        }
+      }
+      
+      if (serverWs.readyState === WebSocket.OPEN) {
+        serverWs.send(data);
+      } else {
+        console.log('[WS] Server not open, readyState:', serverWs.readyState);
+      }
+    });
+    
+    // Handle close events
+    serverWs.addEventListener('close', (event) => {
+      console.log('[WS] Client closed:', event.code, event.reason);
+      containerWs.close(event.code, event.reason);
+    });
+    
+    containerWs.addEventListener('close', (event) => {
+      console.log('[WS] Container closed:', event.code, event.reason);
+      // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
+      let reason = transformErrorMessage(event.reason, url.host);
+      if (reason.length > 123) {
+        reason = reason.slice(0, 120) + '...';
+      }
+      console.log('[WS] Transformed close reason:', reason);
+      serverWs.close(event.code, reason);
+    });
+    
+    // Handle errors
+    serverWs.addEventListener('error', (event) => {
+      console.error('[WS] Client error:', event);
+      containerWs.close(1011, 'Client error');
+    });
+    
+    containerWs.addEventListener('error', (event) => {
+      console.error('[WS] Container error:', event);
+      serverWs.close(1011, 'Container error');
+    });
+    
+    console.log('[WS] Returning intercepted WebSocket response');
+    return new Response(null, {
+      status: 101,
+      webSocket: clientWs,
+    });
   }
 
   console.log('[HTTP] Proxying:', url.pathname + url.search);

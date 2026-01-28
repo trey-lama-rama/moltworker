@@ -186,6 +186,7 @@ export default function AdminPage() {
             <p>
               Paired devices and conversations will be lost when the container restarts.
               To enable persistent storage, configure R2 credentials.
+              See the <a href="https://github.com/cloudflare/moltworker" target="_blank" rel="noopener noreferrer">README</a> for setup instructions.
             </p>
             {storageStatus.missing && (
               <p className="missing-secrets">
