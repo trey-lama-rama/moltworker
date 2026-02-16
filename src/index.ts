@@ -114,6 +114,9 @@ function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
   return { sleepAfter };
 }
 
+/** Cached env validation result. Env vars don't change within an isolate. */
+let envValidationResult: string[] | null = null;
+
 // Main app
 const app = new Hono<AppEnv>();
 
@@ -126,9 +129,6 @@ app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
   const redactedSearch = redactSensitiveParams(url);
   console.log(`[REQ] ${c.req.method} ${url.pathname}${redactedSearch}`);
-  console.log(`[REQ] Has ANTHROPIC_API_KEY: ${!!c.env.ANTHROPIC_API_KEY}`);
-  console.log(`[REQ] DEV_MODE: ${c.env.DEV_MODE}`);
-  console.log(`[REQ] DEBUG_ROUTES: ${c.env.DEBUG_ROUTES}`);
   await next();
 });
 
@@ -169,7 +169,10 @@ app.use('*', async (c, next) => {
     return next();
   }
 
-  const missingVars = validateRequiredEnv(c.env);
+  if (envValidationResult === null) {
+    envValidationResult = validateRequiredEnv(c.env);
+  }
+  const missingVars = envValidationResult;
   if (missingVars.length > 0) {
     console.error('[CONFIG] Missing required environment variables:', missingVars.join(', '));
 
@@ -262,6 +265,16 @@ app.all('*', async (c) => {
     console.error('[PROXY] Failed to start Moltbot:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
+    // If the DO is resetting (deploy transition), show the loading page
+    // instead of a hard error. The next request will retry.
+    if (
+      errorMessage.includes('Durable Object reset') ||
+      errorMessage.includes('Network connection lost')
+    ) {
+      console.log('[PROXY] DO resetting, serving loading page');
+      return c.html(loadingPageHtml);
+    }
+
     let hint = 'Check worker logs with: wrangler tail';
     if (!c.env.ANTHROPIC_API_KEY) {
       hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
@@ -289,15 +302,10 @@ app.all('*', async (c) => {
       console.log('[WS] URL:', url.pathname + redactedSearch);
     }
 
-    // Inject gateway token into WebSocket request if not already present.
-    // CF Access redirects strip query params, so authenticated users lose ?token=.
-    // Since the user already passed CF Access auth, we inject the token server-side.
-    let wsRequest = request;
-    if (c.env.MOLTBOT_GATEWAY_TOKEN && !url.searchParams.has('token')) {
-      const tokenUrl = new URL(url.toString());
-      tokenUrl.searchParams.set('token', c.env.MOLTBOT_GATEWAY_TOKEN);
-      wsRequest = new Request(tokenUrl.toString(), request);
-    }
+    // NOTE: Gateway token injection is disabled. The Containers wsConnect() API
+    // does not forward query params, so injecting ?token= here has no effect.
+    // Auth is handled by Cloudflare Access at the Worker layer instead.
+    const wsRequest = request;
 
     // Get WebSocket connection to the container
     const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
@@ -327,7 +335,8 @@ app.all('*', async (c) => {
       console.log('[WS] serverWs.readyState:', serverWs.readyState);
     }
 
-    // Relay messages from client to container
+    // Relay messages from client to container, injecting auth on connect
+    let connectAuthInjected = false;
     serverWs.addEventListener('message', (event) => {
       if (debugLogs) {
         console.log(
@@ -336,8 +345,32 @@ app.all('*', async (c) => {
           typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)',
         );
       }
+
+      let data = event.data;
+
+      // Rewrite the first "connect" message from the browser:
+      // 1. Inject the gateway token (OpenClaw requires it for LAN-bound gateways)
+      // 2. Strip the device field (its signature covers the original auth token,
+      //    which doesn't include our injected token, causing "device signature invalid")
+      // Real auth is handled by Cloudflare Access at the Worker layer.
+      if (!connectAuthInjected && typeof data === 'string' && c.env.MOLTBOT_GATEWAY_TOKEN) {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.method === 'connect' && parsed.params) {
+            parsed.params.auth = parsed.params.auth || {};
+            parsed.params.auth.token = c.env.MOLTBOT_GATEWAY_TOKEN;
+            delete parsed.params.device;
+            data = JSON.stringify(parsed);
+            connectAuthInjected = true;
+            console.log('[WS] Rewrote connect message (token injected, device stripped)');
+          }
+        } catch {
+          // Not JSON, pass through
+        }
+      }
+
       if (containerWs.readyState === WebSocket.OPEN) {
-        containerWs.send(event.data);
+        containerWs.send(data);
       } else if (debugLogs) {
         console.log('[WS] Container not open, readyState:', containerWs.readyState);
       }
@@ -419,8 +452,33 @@ app.all('*', async (c) => {
       serverWs.close(1011, 'Container error');
     });
 
+    // Keepalive: ping both sides every 30 seconds to prevent idle timeout.
+    // Cloudflare Workers WebSockets don't support native ping frames, so we
+    // send a small JSON message that OpenClaw will ignore (unknown methods
+    // are silently dropped). The browser side gets a similar keepalive that
+    // the Control UI ignores.
+    const KEEPALIVE_INTERVAL_MS = 30_000;
+    const keepaliveMsg = JSON.stringify({ method: '__ping', ts: 0 });
+    const keepaliveInterval = setInterval(() => {
+      try {
+        if (serverWs.readyState === WebSocket.OPEN) {
+          serverWs.send(keepaliveMsg);
+        }
+        if (containerWs.readyState === WebSocket.OPEN) {
+          containerWs.send(keepaliveMsg);
+        }
+      } catch {
+        // Ignore send errors during keepalive
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+
+    // Clean up keepalive on close
+    const clearKeepalive = () => clearInterval(keepaliveInterval);
+    serverWs.addEventListener('close', clearKeepalive);
+    containerWs.addEventListener('close', clearKeepalive);
+
     if (debugLogs) {
-      console.log('[WS] Returning intercepted WebSocket response');
+      console.log('[WS] Returning intercepted WebSocket response (keepalive enabled)');
     }
     return new Response(null, {
       status: 101,
@@ -436,6 +494,113 @@ app.all('*', async (c) => {
   const newHeaders = new Headers(httpResponse.headers);
   newHeaders.set('X-Worker-Debug', 'proxy-to-moltbot');
   newHeaders.set('X-Debug-Path', url.pathname);
+
+  // Inject auto-reconnect script into HTML pages from the gateway.
+  // This detects WebSocket disconnection and auto-reconnects with a
+  // visible notification banner so the user knows what happened.
+  const contentType = httpResponse.headers.get('Content-Type') || '';
+  if (contentType.includes('text/html') && httpResponse.status === 200) {
+    const originalHtml = await httpResponse.text();
+    const reconnectScript = `
+<script>
+(function(){
+  // Auto-reconnect: monitor WebSocket connections and recover on disconnect
+  var banner = null;
+  var reconnectTimer = null;
+  var reconnectAttempts = 0;
+  var MAX_RECONNECT_ATTEMPTS = 60;
+
+  function showBanner(msg, type) {
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'ws-reconnect-banner';
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;padding:10px 16px;font-family:system-ui,sans-serif;font-size:14px;text-align:center;transition:opacity 0.3s;';
+      document.body.appendChild(banner);
+    }
+    banner.style.background = type === 'error' ? '#dc2626' : type === 'warn' ? '#d97706' : '#16a34a';
+    banner.style.color = '#fff';
+    banner.textContent = msg;
+    banner.style.opacity = '1';
+  }
+
+  function hideBanner() {
+    if (banner) {
+      banner.style.opacity = '0';
+      setTimeout(function(){ if(banner) banner.remove(); banner = null; }, 300);
+    }
+  }
+
+  // Monkey-patch WebSocket to intercept close/error events
+  var OrigWebSocket = window.WebSocket;
+  window.WebSocket = function(url, protocols) {
+    var ws = protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+
+    ws.addEventListener('close', function(e) {
+      // Code 1000 = normal close, 1005 = no status. Anything else or unexpected = reconnect
+      if (e.code !== 1000) {
+        console.log('[reconnect] WebSocket closed:', e.code, e.reason);
+        attemptReconnect();
+      }
+    });
+
+    ws.addEventListener('error', function() {
+      console.log('[reconnect] WebSocket error');
+    });
+
+    ws.addEventListener('open', function() {
+      if (reconnectAttempts > 0) {
+        showBanner('Reconnected to Chancellor', 'ok');
+        setTimeout(hideBanner, 3000);
+      }
+      reconnectAttempts = 0;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    });
+
+    return ws;
+  };
+  // Preserve prototype chain for instanceof checks
+  window.WebSocket.prototype = OrigWebSocket.prototype;
+  window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+  window.WebSocket.OPEN = OrigWebSocket.OPEN;
+  window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+  window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+
+  function attemptReconnect() {
+    if (reconnectTimer) return;
+    reconnectAttempts++;
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      showBanner('Connection lost. Please refresh the page.', 'error');
+      return;
+    }
+    var delay = Math.min(2000 * reconnectAttempts, 15000);
+    showBanner('Disconnected. Reconnecting in ' + Math.round(delay/1000) + 's... (attempt ' + reconnectAttempts + ')', 'warn');
+    reconnectTimer = setTimeout(function() {
+      reconnectTimer = null;
+      showBanner('Reconnecting...', 'warn');
+      // Reload the page to re-establish all connections cleanly
+      window.location.reload();
+    }, delay);
+  }
+})();
+</script>`;
+
+    // Inject before </head> or </body>, whichever comes first
+    let injectedHtml = originalHtml;
+    if (originalHtml.includes('</head>')) {
+      injectedHtml = originalHtml.replace('</head>', reconnectScript + '</head>');
+    } else if (originalHtml.includes('</body>')) {
+      injectedHtml = originalHtml.replace('</body>', reconnectScript + '</body>');
+    } else {
+      injectedHtml = originalHtml + reconnectScript;
+    }
+
+    newHeaders.delete('Content-Length');
+    return new Response(injectedHtml, {
+      status: httpResponse.status,
+      statusText: httpResponse.statusText,
+      headers: newHeaders,
+    });
+  }
 
   return new Response(httpResponse.body, {
     status: httpResponse.status,

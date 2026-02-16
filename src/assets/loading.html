@@ -156,7 +156,11 @@
       const errorEl = document.getElementById('error');
       let pollCount = 0;
       let consecutiveErrors = 0;
+      let notRunningCount = 0;
       const maxConsecutiveErrors = 5;
+      // After this many "not_running" polls, do a full page reload to
+      // re-trigger gateway startup (the catch-all handler starts it).
+      const notRunningReloadThreshold = 15;
 
       async function checkStatus() {
         pollCount++;
@@ -181,8 +185,17 @@
 
           // Update status message based on state
           if (data.status === 'not_running') {
+            notRunningCount++;
+            // If gateway has been "not_running" for too long, do a full page
+            // reload. The catch-all handler will re-trigger ensureMoltbotGateway.
+            if (notRunningCount >= notRunningReloadThreshold) {
+              statusEl.textContent = 'Restarting gateway...';
+              setTimeout(() => { window.location.reload(); }, 1000);
+              return;
+            }
             statusEl.textContent = 'Container is starting up...';
           } else if (data.status === 'not_responding') {
+            notRunningCount = 0;
             statusEl.textContent = 'Container started, waiting for gateway...';
           } else {
             statusEl.textContent = 'Checking status... (poll #' + pollCount + ')';

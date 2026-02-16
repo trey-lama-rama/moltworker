@@ -26,6 +26,7 @@ export interface MoltbotEnv {
   SANDBOX_SLEEP_AFTER?: string; // How long before sandbox sleeps: 'never' (default), or duration like '10m', '1h'
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_DM_POLICY?: string;
+  TELEGRAM_DM_ALLOW_FROM?: string;
   DISCORD_BOT_TOKEN?: string;
   DISCORD_DM_POLICY?: string;
   SLACK_BOT_TOKEN?: string;
@@ -42,6 +43,17 @@ export interface MoltbotEnv {
   BROWSER?: Fetcher;
   CDP_SECRET?: string; // Shared secret for CDP endpoint authentication
   WORKER_URL?: string; // Public URL of the worker (for CDP endpoint)
+  // Google OAuth credentials (for Gmail/Calendar integration)
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  GOOGLE_REFRESH_TOKEN?: string; // Gmail
+  GOOGLE_CALENDAR_REFRESH_TOKEN?: string; // Google Calendar
+  // Supermemory API (persistent memory across sessions)
+  SUPERMEMORY_API_KEY?: string;
+  // Twilio (voice calls via OpenClaw voice-call plugin)
+  TWILIO_ACCOUNT_SID?: string;
+  TWILIO_AUTH_TOKEN?: string;
+  TWILIO_PHONE_NUMBER?: string;
 }
 
 /**
