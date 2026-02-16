@@ -32,12 +32,15 @@ RUN mkdir -p /root/.openclaw \
     && mkdir -p /root/clawd/skills
 
 # Copy startup script
-# Build cache bust: 2026-02-11-v30-rclone
+# Build cache bust: 2026-02-16-v50-warm-restart-parallel-r2
 COPY start-openclaw.sh /usr/local/bin/start-openclaw.sh
 RUN chmod +x /usr/local/bin/start-openclaw.sh
 
 # Copy custom skills
 COPY skills/ /root/clawd/skills/
+
+# Copy workspace bootstrap files (Chancellor identity)
+COPY workspace-files/ /root/workspace-bootstrap/
 
 # Set working directory
 WORKDIR /root/clawd
