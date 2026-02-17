@@ -56,6 +56,13 @@
     },
   ],
   // R2 bucket for persistent storage (moltbot data, conversations, etc.)
+  // Cron trigger: health-check the gateway every 2 minutes.
+  // If the container died (DO reset, crash, etc.), this restarts it
+  // automatically so Telegram polling resumes without manual intervention.
+  "triggers": {
+    "crons": ["*/2 * * * *"],
+  },
+  // R2 bucket for persistent storage (moltbot data, conversations, etc.)
   "r2_buckets": [
     {
       "binding": "MOLTBOT_BUCKET",

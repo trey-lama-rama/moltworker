@@ -611,4 +611,31 @@ app.all('*', async (c) => {
 
 export default {
   fetch: app.fetch,
+
+  /**
+   * Cron trigger: health-check the gateway every 2 minutes.
+   * If the container died after a DO reset or crash, this restarts it
+   * so Telegram polling resumes without manual intervention.
+   */
+  async scheduled(event: ScheduledEvent, env: MoltbotEnv, ctx: ExecutionContext) {
+    try {
+      const options = buildSandboxOptions(env);
+      const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
+      const process = await findExistingMoltbotProcess(sandbox);
+
+      if (process && process.status === 'running') {
+        console.log('[CRON] Gateway is running, nothing to do');
+        return;
+      }
+
+      console.log('[CRON] Gateway not running, starting...');
+      ctx.waitUntil(
+        ensureMoltbotGateway(sandbox, env)
+          .then(() => console.log('[CRON] Gateway started successfully'))
+          .catch((err: Error) => console.error('[CRON] Gateway start failed:', err.message)),
+      );
+    } catch (err) {
+      console.error('[CRON] Health check failed:', err);
+    }
+  },
 };
